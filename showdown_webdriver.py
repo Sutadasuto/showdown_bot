@@ -5,6 +5,7 @@ os.environ["PATH"] += ":drivers"
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -235,6 +236,19 @@ class Driver(object):
                     return (terrain_name, int(min_turns))
         return ("none", 0)
 
+    def get_weather(self):
+        'Returns: a tuple (current weather -or "none" if no weather is present-, minimum turns left)'
+
+        weather_names = ["sun", "rain", "sandstorm", "hail"]
+        battlefield_elements = self.find_battlefield_elements()
+        for weather_name in weather_names:
+            for element in battlefield_elements:
+                if "%s " % weather_name in element:
+                    # E.g. Sun (3 or 6 turns)
+                    min_turns = element.split(" (")[1].split(" or ")[0]
+                    return (weather_name, int(min_turns))
+        return ("none", 0)
+
     def get_rooms(self):
         ':return a list of tuples (name of current room -or "none" if no room is present-, turns left)'
 
@@ -271,7 +285,7 @@ class Driver(object):
         # Find the buttons available to "Attack"
         try:
             buttons = WebDriverWait(self.webdriver, 60).until(
-                EC.presence_of_element_located((By.XPATH, "//button[@name='chooseMove']"))
+                EC.presence_of_all_elements_located((By.XPATH, "//button[@name='chooseMove']"))
             )
         except:
             print("No attack buttons found... Maybe they are hidden under 'Attack'?")
@@ -280,10 +294,13 @@ class Driver(object):
         for button in buttons:
             button_text = button.text.strip()
             # E.g. Stealth Rock\nRock\n32/32
-            button_info = button_text.split("\n")
-            name = button_info[0]
-            pp = int(button_info[-1].split("/")[0])
-            moves.append((name, pp))
+            # For double battles, text is empty for the partner pokémon
+            # We handle this by ignoring buttons with no text
+            if button_text != "":
+                button_info = button_text.split("\n")
+                name = button_info[0]
+                pp = int(button_info[-1].split("/")[0])
+                moves.append((name, pp))
 
         return moves
 
@@ -378,6 +395,204 @@ class Driver(object):
                 return False
         except:
             return None
+
+    def get_my_active_pokemon(self, singles=True):
+
+        n_pokemon = 1 if singles else 2
+        pokemon = []
+
+        for poke in range(n_pokemon):
+            # Find the sprite of the active pokémon in the battlefield
+            active_poke = self.webdriver.find_element_by_xpath(
+                "//div[@class='has-tooltip' and @data-tooltip='activepokemon|0|%s']" % poke)
+            # Hover over the sprite to open the tooltip menu with the pokémon's information
+            ActionChains(self.webdriver).move_to_element(active_poke).perform()
+            # Get text from the menu
+            try:
+                info = self.webdriver.find_element_by_xpath("//div[@class='tooltip']").text.split("\n")
+            except:
+                print("No active pokémon at position %s!" % poke)
+                continue
+            # E.g.
+            # Tyranitar L50
+            # HP: 100% (414 / 414)
+            # Ability: Sand Stream
+            # Item: Life Orb
+            # Atk 204 / Def 130 / SpA 98 / SpD 121 / Spe 81
+            # • Protect(15 / 16)
+            # • Max Guard(7 / 8)
+
+            poke_dict = {}
+            poke_dict["name"] = info[0].split(" L")[0]
+            # Look if there is a nick in the name E.g. Ttar (Tyranitar) (Ttar is the nick, Tyranitar the species)
+            if len(poke_dict["name"].split(" (")) == 2:
+                nick, name = poke_dict["name"].split(" (")
+                poke_dict["nick"] = nick
+                poke_dict["name"] = name[:-1]
+            else:
+                poke_dict["nick"] = poke_dict["name"]
+            try:
+                min_hp, max_hp = info[1].split(" ")[1].split("–")
+            except ValueError:
+                min_hp = max_hp = info[1].split(" ")[1]
+                min_hp = min_hp[:-1]
+            poke_dict["hp_range"] = (float(min_hp), float(max_hp[:-1]))
+            poke_dict["ability"] = info[2].split(": ")[1]
+            poke_dict["item"] = info[3].split(": ")[1]
+            for stat in info[4].split(" / "):
+                stat_name, stat_value = stat.split(" ")
+                poke_dict[stat_name.lower()] = int(stat_value)
+            pokemon.append(poke_dict)
+
+            # Find icons in the menu
+            icons = self.webdriver.find_element_by_xpath("//div[@class='tooltip']").find_elements_by_class_name(
+                "pixelated")
+            types = []
+            for icon in icons:
+                alt_property = icon.get_attribute("alt")
+                # Check if icons are not gender related
+                if alt_property != "M" and alt_property != "F":
+                    types.append(alt_property)
+            # If pokémon has only one type, add None as second type
+            if len(types) == 1:
+                types.append(None)
+            poke_dict["types"] = tuple(types)
+
+            # Look at current status drops/boosts
+            stats = ["atk", "def", "spa", "spd", "spe"]
+            stat_keyword = "_multiplier"
+            for stat in stats:
+                poke_dict[stat + stat_keyword] = 1.0
+            status_bars = self.webdriver.find_elements_by_class_name("rstatbar")
+            for bar in status_bars:
+                # E.g.
+                # Topo L50
+                # 82%
+                # 2× Atk 0.67× Def
+                status_info = bar.text.split("\n")
+                # Check if stat bar corresponds to current pokémon
+                if status_info[0].startswith(poke_dict["nick"] + " "):
+                    if len(status_info) > 1:
+                        for stat in stats:
+                            if len(status_info[-1].lower().split("× %s" % stat)) == 2:
+                                multiplier = status_info[-1].lower().split("× %s" % stat)[0].split(" ")[-1]
+                                poke_dict[stat + stat_keyword] = float(multiplier)
+                    break
+
+        if singles:
+            return pokemon[0]
+        else:
+            return pokemon
+
+    def get_foe_active_pokemon(self, singles=True):
+
+        n_pokemon = 1 if singles else 2
+        pokemon = []
+
+        for poke in range(n_pokemon):
+            # Find the sprite of the active pokémon in the battlefield
+            active_poke = self.webdriver.find_element_by_xpath(
+                "//div[@class='has-tooltip' and @data-tooltip='activepokemon|1|%s']" % poke)
+            # Hover over the sprite to open the tooltip menu with the pokémon's information
+            ActionChains(self.webdriver).move_to_element(active_poke).perform()
+            # Get text from the menu
+            try:
+                info = self.webdriver.find_element_by_xpath("//div[@class='tooltip']").text.split("\n")
+            except:
+                print("No active pokémon at position %s!" % poke)
+                continue
+            # E.g.
+            # Venusaur L50
+            # (Changed forme: Venusaur-Gmax)
+            # HP: 100% (48 / 48 pixels)
+            # Possible abilities: Overgrow, Chlorophyll
+            # Spe 76 to 145(before items / abilities / modifiers)
+            # • Max Guard (6 / 8)
+
+            poke_dict = {}
+            poke_dict["name"] = info[0].split(" L")[0]
+            # Look if there is a nick in the name E.g. Ttar (Tyranitar) (Ttar is the nick, Tyranitar the species)
+            if len(poke_dict["name"].split(" (")) == 2:
+                nick, name = poke_dict["name"].split(" (")
+                poke_dict["nick"] = nick
+                poke_dict["name"] = name[:-1]
+            else:
+                poke_dict["nick"] = poke_dict["name"]
+            for line in info[1:]:
+                if line.startswith("HP"):
+                    try:
+                        min_hp, max_hp = line.split(" ")[1].split("–")
+                    except ValueError:
+                        min_hp = max_hp = info[1].split(" ")[1]
+                        min_hp = min_hp[:-1]
+                    poke_dict["hp_range"] = (float(min_hp), float(max_hp[:-1]))
+                    break
+            for line in info[1:]:
+                if line.startswith("Ability"):
+                    poke_dict["ability"] = line.split(": ")[1]
+                    break
+            for line in info[1:]:
+                if line.startswith("Possible abilities"):
+                    poke_dict["ability"] = tuple(line.split(": ")[1].split(", "))
+                    break
+            for line in info[1:]:
+                if line.startswith("Spe"):
+                    words = line.split(" ")
+                    poke_dict["speed_range"] = (words[1], words[3])
+                    break
+            for line in info[1:]:
+                if line.startswith("Item"):
+                    poke_dict["item"] = line.split(": ")[1]
+                    break
+            known_moves = []
+            move_start = "• "
+            for line in info[1:]:
+                if line.startswith(move_start):
+                    # E.g. "• Protect (14/16)"
+                    move = line[len(move_start):].split(" (")[0]
+                    known_moves.append(move)
+            poke_dict["moves"] = tuple(known_moves)
+
+            # Find icons in the menu
+            icons = self.webdriver.find_element_by_xpath("//div[@class='tooltip']").find_elements_by_class_name("pixelated")
+            types = []
+            for icon in icons:
+                alt_property = icon.get_attribute("alt")
+                # Check if icons are not gender related
+                if alt_property != "M" and alt_property != "F":
+                    types.append(alt_property)
+            # If pokémon has only one type, add None as second type
+            if len(types) == 1:
+                types.append(None)
+            poke_dict["types"] = tuple(types)
+
+            # Look at current status drops/boosts
+            stats = ["atk", "def", "spa", "spd", "spe"]
+            stat_keyword = "_multiplier"
+            for stat in stats:
+                poke_dict[stat + stat_keyword] = 1.0
+            status_bars = self.webdriver.find_elements_by_class_name("lstatbar")
+            for bar in status_bars:
+                # E.g.
+                # Topo L50
+                # 82%
+                # 2× Atk 0.67× Def
+                status_info = bar.text.split("\n")
+                # Check if stat bar corresponds to current pokémon
+                if status_info[0].startswith(poke_dict["nick"] + " "):
+                    if len(status_info) > 1:
+                        for stat in stats:
+                            if len(status_info[-1].lower().split("× %s" % stat)) == 2:
+                                multiplier = status_info[-1].lower().split("× %s" % stat)[0].split(" ")[-1]
+                                poke_dict[stat + stat_keyword] = float(multiplier)
+                    break
+
+            pokemon.append(poke_dict)
+
+        if singles:
+            return pokemon[0]
+        else:
+            return pokemon
 
     def find_battlefield_elements(self):
         # Find the div in the battle screen that prints the current terrain (among other battlefield conditions)
